@@ -14,7 +14,7 @@ api_key = os.getenv("API_KEY")
 
 model = ChatOpenAI(
     api_key=api_key,
-    model="glm-4",
+    model="glm-4",  # 需要指定模型
     base_url="https://open.bigmodel.cn/api/paas/v4/",
     timeout=120, # 超时时间
     temperature=0, # 控制模型输出的随机性。较高的数量使回答更具创造性；较低的数量使回答更确定。
@@ -113,7 +113,6 @@ model_with_tools = model.bind_tools([get_weather])
 # print(response.content) # 这里返回为空，因为这里只是大模型调用工具，并没有生成答案
 
 
-
 # Structured output  结构化输出  glm-4不支持 with_structured_output
 class Movie(BaseModel):
     ''' A movie with details.'''
@@ -126,21 +125,43 @@ class Movie(BaseModel):
 # response = model_with_structure.invoke("Provide details about the movie Inception")
 # print(response)
 
-parser = JsonOutputParser(pydantic_object=Movie)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "你是一个电影信息助手。"),
-    ("user", "{query}\n\n{format_instructions}")
-])
+'''
+  title: str = Field(..., description="Title of the movie")
 
-chain = prompt | model | parser
+  | 部分         | 含义                                              |
+  |--------------|---------------------------------------------------|
+  | ...          | Ellipsis 对象，表示该字段是必填的（required）     |
+  | description= | 给 LLM 的描述说明，告诉模型这个字段应该填什么内容 | 
+    简记: ... = "必须有值"，description = "给 LLM 看的说明"
+'''
 
-response = chain.invoke({
-    "query": "Provide details about the movie Inception",
-    "format_instructions": parser.get_format_instructions()
-})
+# parser = JsonOutputParser(pydantic_object=Movie)
+#
+# prompt = ChatPromptTemplate.from_messages([
+#     ("system", "你是一个电影信息助手。"),
+#     ("user", "{query}\n\n{format_instructions}")
+# ])
+
+# chain = prompt | model | parser
+
+# response = chain.invoke({
+#     "query": "Provide details about the movie Inception",
+#     "format_instructions": parser.get_format_instructions()
+# })
 '''
 BaseModel 定义 → get_format_instructions() → 格式说明 → LLM 按格式返回
 你定义一次 Movie 类，get_format_instructions() 自动把要求翻译给 LLM 听。
 '''
-print(response)
+# print(response)
+
+
+# Multimodal  多模态  glm-4是纯文本
+# response = model.invoke("Create a picture of a cat")
+# print(response.content_blocks)
+
+
+# Reasoning  推理 (GLM-4 不支持 reasoning blocks，这是 OpenAI o1 系列的特性)
+# 普通流式输出
+for chunk in model.stream("Why do parrots have colorful feathers?"):
+    print(chunk.content, end="", flush=True)
