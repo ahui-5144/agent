@@ -163,5 +163,6 @@ BaseModel 定义 → get_format_instructions() → 格式说明 → LLM 按格�
 
 # Reasoning  推理 (GLM-4 不支持 reasoning blocks，这是 OpenAI o1 系列的特性)
 # 普通流式输出
-for chunk in model.stream("Why do parrots have colorful feathers?"):
-    print(chunk.content, end="", flush=True)
+# if __name__ == "__main__":
+#     for chunk in model.stream("Why do parrots have colorful feathers?"):
+#         print(chunk.content, end="", flush=True)

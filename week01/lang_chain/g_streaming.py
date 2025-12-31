@@ -1,15 +1,19 @@
 import os
+from importlib.metadata import metadata
 from typing import Literal, Any
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent, AgentState
-from langchain.agents.middleware import after_agent
+from langchain.agents.middleware import after_agent, HumanInTheLoopMiddleware
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessageChunk, AnyMessage,AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.runtime import Runtime
+from langgraph.types import Interrupt, Command
+from langsmith._internal._patch import request
 from pydantic import BaseModel
 
 from week01.lang_chain.c_models import model_with_tools
@@ -17,6 +21,7 @@ from week01.lang_chain.c_models import model_with_tools
 load_dotenv()
 
 api_key = os.getenv("API_KEY")
+ali_api_key = os.getenv("ALI_API_KEY")
 
 model = ChatOpenAI(
     model="glm-4",
@@ -175,18 +180,18 @@ def _render_completed_message(message: AnyMessage) -> None:
 
 input_message = {"role":"user", "content":"What is the weather in Boston?"}
 
-for stream_mode, data in agent4.stream(
-        {"messages": [input_message]},
-        stream_mode=["messages", "updates"],
-):
-    if stream_mode == "messages":
-        token, metadata = data  # 解包元组
-        if isinstance(token, AIMessageChunk):  # 类型检查
-            _render_message_chunk(token)
-    if stream_mode == "updates":
-        for source, update in data.items(): # 遍历字典
-            if source in ("model", "tools"):  # `source` captures node name
-                _render_completed_message(update["messages"][-1])  # 取最新消息
+# for stream_mode, data in agent4.stream(
+#         {"messages": [input_message]},
+#         stream_mode=["messages", "updates"],
+# ):
+#     if stream_mode == "messages":
+#         token, metadata = data  # 解包元组
+#         if isinstance(token, AIMessageChunk):  # 类型检查
+#             _render_message_chunk(token)
+#     if stream_mode == "updates":
+#         for source, update in data.items(): # 遍历字典
+#             if source in ("model", "tools"):  # `source` captures node name
+#                 _render_completed_message(update["messages"][-1])  # 取最新消息
 """ console
 [{'name': 'get_weather', 'args': '{"city":"Boston"}', 'id': 'call_20251230172639d0c19690b1a141ee_0', 'index': 0, 'type': 'tool_call_chunk'}]
 Tool calls: [{'name': 'get_weather', 'args': {'city': 'Boston'}, 'id': 'call_20251230172639d0c19690b1a141ee_0', 'type': 'tool_call'}]
@@ -217,14 +222,18 @@ class ResponseSafety(BaseModel):
     """Evaluate a response as safe or unsafe."""
     evaluation: Literal["safe", "unsafe"]
 
-flash_model=ChatOpenAI(
-    model="glm-4-flash",
-    api_key=api_key,
-    base_url="https://open.bigmodel.cn/api/paas/v4/",
-)
+# 智谱的模型不支持推理
+# safety_model = ChatOpenAI(
+#     model="glm-4-flash",
+#     api_key=api_key,
+#     base_url="https://open.bigmodel.cn/api/paas/v4/",
+#     temperature=0.7,
+# )
 
-safety_model = init_chat_model(
-    model=flash_model
+safety_model = ChatOpenAI(
+    model="qwen-max",  # 或 "qwen-qwq-32b-preview"
+    api_key=ali_api_key,
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 @after_agent(can_jump_to=["end"]) #  can_jump_to=["end"] 允许直接跳转到 end 节点（提前结束）
@@ -233,23 +242,37 @@ def safety_guardrail(state: AgentState, runtime: Runtime) -> dict[str, Any] | No
     stream_writer = get_stream_writer()
     # Get model response
     if not state["messages"]:
-        return None # 如果没有消息就什么都不干直接返回
+        return None
 
     last_message = state["messages"][-1]
     if not isinstance(last_message, AIMessage):
-        return None # 如果最后一条消息不是ai返回的消息也不处理，通常最后一条消息是ai返回的消息
+        return None
 
     # Use another model to evaluate safety
-    model_with_tools = safety_model.bind_tools([ResponseSafety], tool_choice="any") #绑定工具，让 LLM 返回结构化输出 绑定工具，让 LLM 返回结构化输出
-    result = model_with_tools.invoke(
-        [
-            {
-                "role": "system",
-                "content":"Evaluate this AI response as generally safe or unsafe."
-            }
-        ],
-        {"role":"user", "content": f"AI response: {last_message.text}"},
-    )
+    model_with_tools = safety_model.bind_tools([ResponseSafety], tool_choice="any")
+    # openai写法
+    # result = model_with_tools.invoke(
+    #     [
+    #         {
+    #             "role": "system",
+    #             "content":"Evaluate this AI response as generally safe or unsafe."
+    #         }
+    #     ],
+    #     {"role":"user", "content": f"AI response: {last_message.text}"},
+    # )
+    # 修复：构造完整的消息列表
+    evaluation_messages = [
+        {
+            "role": "system",
+            "content": "You are a safety evaluator. Determine if the following AI response is safe or unsafe. "
+                       "Respond only with the tool call using the ResponseSafety tool."
+        },
+        {
+            "role": "user",
+            "content": f"AI response to evaluate:\n\n{last_message.content}"
+        }
+    ]
+    result = model_with_tools.invoke(evaluation_messages)
     stream_writer(result)
 
     tool_call = result.tool_calls[0]
@@ -257,6 +280,39 @@ def safety_guardrail(state: AgentState, runtime: Runtime) -> dict[str, Any] | No
         last_message.content = "I cannot provide that response. Please rephrase your request."
 
     return None
+
+
+agent8 = create_agent(
+    model=model,
+    tools=[get_weather],
+    middleware=[safety_guardrail],
+)
+
+# input_message = {"role": "user", "content": "What is the weather in Boston?"}
+# for stream_mode, data in agent8.stream(
+#     {"messages": [input_message]},
+#     stream_mode=["messages", "updates", "custom"],
+# ):
+#     if stream_mode == "messages":
+#         token, metadata = data
+#         if isinstance(token, AIMessageChunk):
+#             _render_message_chunk(token)
+#     if stream_mode == "updates":
+#         for source, update in data.items():
+#             if source in ("model", "tools"):
+#                 _render_completed_message(update["messages"][-1])
+#     if stream_mode == "custom":
+#         # access completed message in stream
+#         print(f"Tool calls: {data.tool_calls}")
+
+"""
+[{'name': 'get_weather', 'args': '{"city":"Boston"}', 'id': 'call_20251231101928fa691a37db804dfc_0', 'index': 0, 'type': 'tool_call_chunk'}]
+Tool calls: [{'name': 'get_weather', 'args': {'city': 'Boston'}, 'id': 'call_20251231101928fa691a37db804dfc_0', 'type': 'tool_call'}]
+Tool response: [{'type': 'text', 'text': ' The weather in Boston is sunny! '}]
+According| to| the| API| call| result|,| the| weather| in| Boston| is| sunny|.| I| hope| this| answer| is| helpful| to| you|!|[{'name': 'ResponseSafety', 'args': '{"evaluation": "safe', 'id': 'call_0d80fc5b54eb4e578cbaec', 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '"}', 'id': '', 'index': 0, 'type': 'tool_call_chunk'}]
+Tool calls: [{'name': 'ResponseSafety', 'args': {'evaluation': 'safe'}, 'id': 'call_0d80fc5b54eb4e578cbaec', 'type': 'tool_call'}]
+"""
 
 """
 Q:@after_agen 和 @after_model有什么区别
@@ -268,4 +324,159 @@ Q:@after_agen 和 @after_model有什么区别
   | 能看到什么 | 单次 LLM 响应            | 最终完整结果           |
   | 典型用途   | 过滤敏感词、日志         | 安全护栏、最终验证     |
   | 执行位置   | model 节点之后           | agent 流程结束后       |
+"""
+
+# Streaming with human-in-the-loop
+
+def _render_interrupt(interrupt: Interrupt) -> None:
+    interrupts = interrupt.value
+    for request in interrupts["action_requests"]:
+        print(request["description"])
+
+checkpointer = InMemorySaver()
+
+agent9 = create_agent(
+    model=model,
+    tools=[get_weather],
+    middleware=[
+        HumanInTheLoopMiddleware(interrupt_on={"get_weather": True}), # interrupt_on={"get_weather": True} 当调用 get_weather 工具时触发中断
+        safety_guardrail,
+    ],
+    checkpointer=checkpointer,
+)
+
+config = {"configurable": {"thread_id": "some_id"}}
+
+# ============ 第一阶段：初始运行，触发中断 ============
+input_message = {
+    "role": "user",
+    "content": "Can you look up the weather in Boston and San Francisco?"
+}
+
+interrupts = []  # 用于收集中断
+
+for stream_mode, data in agent9.stream(
+    {"messages": [input_message]},  # ← 传入初始消息
+    config=config,
+    stream_mode=["messages", "updates"],
+):
+    if stream_mode == "messages":
+        token, metadata = data
+        if isinstance(token, AIMessageChunk):
+            _render_message_chunk(token)
+    if stream_mode == "updates":
+        for source, update in data.items():
+            if source in ("model", "tools"):
+                _render_completed_message(update["messages"][-1])
+            if source == "__interrupt__":
+                interrupts.extend(update)
+                _render_interrupt(update[0])
+""" console
+[{'name': 'get_weather', 'args': '', 'id': 'call_GOwNaQHeqMixay2qy80padfE', 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '{"ci', 'id': None, 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': 'ty": ', 'id': None, 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '"Bosto', 'id': None, 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': 'n"}', 'id': None, 'index': 0, 'type': 'tool_call_chunk'}]
+[{'name': 'get_weather', 'args': '', 'id': 'call_Ndb4jvWm2uMA0JDQXu37wDH6', 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '{"ci', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': 'ty": ', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '"San F', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': 'ranc', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': 'isco"', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+[{'name': None, 'args': '}', 'id': None, 'index': 1, 'type': 'tool_call_chunk'}]
+Tool calls: [{'name': 'get_weather', 'args': {'city': 'Boston'}, 'id': 'call_GOwNaQHeqMixay2qy80padfE', 'type': 'tool_call'}, {'name': 'get_weather', 'args': {'city': 'San Francisco'}, 'id': 'call_Ndb4jvWm2uMA0JDQXu37wDH6', 'type': 'tool_call'}]
+Tool execution requires approval
+
+Tool: get_weather
+Args: {'city': 'Boston'}
+Tool execution requires approval
+
+Tool: get_weather
+Args: {'city': 'San Francisco'}
+"""
+
+
+# ============ 第二阶段：人工决策后恢复执行 ============
+# 根据收集到的 interrupts 生成 decisions
+def _get_interrupt_decisions(interrupt: Interrupt) -> list[dict]:
+    return [
+        {
+            "type": "edit",
+            "edited_action": {
+                "name": "get_weather", # tool
+                "args": {"city": "Boston, Massachusetts, USA"},  # args
+            },
+        }
+        if "boston" in request["description"].lower()
+        else {"type": "approve"}# 如果是boston就修改参数，其他就直接批准
+        for request in interrupt.value["action_requests"]
+    ]
+
+decisions = {}
+for interrupt in interrupts:
+    decisions[interrupt.id] = {
+        "decisions": _get_interrupt_decisions(interrupt)
+    }
+
+# 恢复运行
+for stream_mode, data in agent9.stream(
+    Command(resume=decisions),  # ← 仅在此阶段传入 resume
+    config=config,
+    stream_mode=["messages", "updates"],
+):
+    if stream_mode == "messages":
+        token, metadata = data
+        if isinstance(token, AIMessageChunk):
+            _render_message_chunk(token)
+    if stream_mode == "updates":
+        for source, update in data.items():
+            if source in ("model", "tools"):
+                _render_completed_message(update["messages"][-1])
+            if source == "__interrupt__":
+                interrupts.extend(update)
+                _render_interrupt(update[0])
+
+"""
+ 核心概念
+
+  在 Agent 执行过程中，人工介入审批工具调用，可以批准、拒绝或修改工具参数。
+
+  ---
+  流程图
+
+  用户请求 → Agent 执行 → 触发中断 → 等待审批 → 人工决策 → 恢复执行 → 返回结果
+                     ↑                                    ↓
+                     └───── checkpointer 保存状态 ─────────┘
+                           （数据库持久化）
+
+  ---
+  关键组件
+
+  | 组件                             | 作用                   |
+  |----------------------------------|------------------------|
+  | HumanInTheLoopMiddleware         | 人机交互中间件         |
+  | interrupt_on={"tool_name": True} | 指定哪些工具需要审批   |
+  | checkpointer                     | 必须！保存状态到数据库 |
+  | thread_id                        | 会话标识，用于恢复     |
+  | Command(resume=decisions)        | 恢复执行并传入决策     |
+  | source == "__interrupt__"        | 捕获中断事件           |
+
+  ---
+  三个决策类型
+
+  # 1. 批准 - 按原计划执行
+  {"type": "approve"}
+
+  # 2. 拒绝 - 不执行该工具
+  {"type": "reject"}
+
+  # 3. 修改 - 修改工具参数
+  {
+      "type": "edit",
+      "edited_action": {
+          "name": "get_weather",
+          "args": {"city": "Boston, USA"}  # 修改后的参数
+      }
+  }
+
 """
