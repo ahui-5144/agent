@@ -16,7 +16,7 @@ from langgraph.prebuilt import ToolRuntime
 base_url 指定了智谱的 API 地址。
 '''
 llm = ChatOpenAI(
-    api_key="1d8df09fb3034f5d9a5740bf51efef8f.nuZBo5BuGT3A70Ps",
+    api_key="",
     model="glm-4",  # 正确模型名：glm-4 或 glm-4-flash
     base_url="https://open.bigmodel.cn/api/paas/v4/",
 )
